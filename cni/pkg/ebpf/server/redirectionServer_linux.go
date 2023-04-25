@@ -404,25 +404,53 @@ func (r *RedirectServer) attachTCForZtunnel(ifindex, peerIndex uint32, namespace
 	return nil
 }
 
+func (r *RedirectServer) delQdiscIfNeeded(namespace string, ifindex uint32) error {
+	objs, err := r.getTCFilters(namespace, ifindex, "ingress")
+	if err != nil {
+		return err
+	}
+	if len(objs) > 0 {
+		log.Debugf("Ifindex %d still has other ingress filters, will not remove the clsact qdisc", ifindex)
+		return nil
+	}
+
+	objs, err = r.getTCFilters(namespace, ifindex, "egress")
+	if err != nil {
+		return err
+	}
+
+	if len(objs) > 0 {
+		log.Debugf("Ifindex %d still has other egress filters, will not remove the clsact qdisc", ifindex)
+		return nil
+	}
+
+	// no filter exists, delete clsact qdisc
+	return r.delClsactQdisc(namespace, ifindex)
+}
 func (r *RedirectServer) detachTCForZtunnel(ifindex, peerIndex uint32, namespace string) error {
-	// delete ztunnel veth's clsact qdisc (in host namespace)
-	if err := r.delClsactQdisc("", ifindex); err != nil {
+	if err := r.detachTC("", ifindex, "ingress", r.ztunnelHostingressProgName); err != nil {
+		return fmt.Errorf("failed to detach TC ingress for ztunnel %d: %v", ifindex, err)
+	}
+
+	if err := r.detachTC(namespace, peerIndex, "ingress", r.ztunnelIngressProgName); err != nil {
+		return fmt.Errorf("failed to detach TC ingress for ztunnel %d(%s): %v", peerIndex, namespace, err)
+	}
+
+	if err := r.delQdiscIfNeeded("", ifindex); err != nil {
 		return err
 	}
-	// delete ztunnel veth's clsact qdisc (in POD namespace)
-	if err := r.delClsactQdisc(namespace, peerIndex); err != nil {
-		return err
-	}
-	return nil
+	return r.delQdiscIfNeeded(namespace, peerIndex)
 }
 
 func (r *RedirectServer) detachTCForWorkload(ifindex uint32) error {
-	// delete workload veth's clsact qdisc (in host namespace)
-	if err := r.delClsactQdisc("", ifindex); err != nil {
-		return err
+	if err := r.detachTC("", ifindex, "ingress", r.outboundProgName); err != nil {
+		return fmt.Errorf("failed to detach TC ingress for IfIndex %d: %v", ifindex, err)
+	}
+	if err := r.detachTC("", ifindex, "egress", r.inboundProgName); err != nil {
+		return fmt.Errorf("failed to detach TC egress for IfIndex %d: %v", ifindex, err)
 	}
 
-	return nil
+	return r.delQdiscIfNeeded("", ifindex)
 }
 
 func (r *RedirectServer) attachTCForWorkLoad(ifindex uint32) error {
@@ -526,6 +554,84 @@ func (r *RedirectServer) attachTC(namespace string, ifindex uint32, direction st
 		if err := rtnl.Filter().Add(&filterEgress); err != nil && !errors.Is(err, os.ErrExist) {
 			log.Warnf("could not attach egress eBPF: %v", err)
 			return err
+		}
+	}
+	return nil
+}
+
+func (r *RedirectServer) getTCFilters(namespace string, ifindex uint32, direction string) ([]tc.Object, error) {
+	config := &tc.Config{}
+	if namespace != "" {
+		nsHdlr, err := ns.GetNS(fmt.Sprintf("/var/run/netns/%s", namespace))
+		if err != nil {
+			return nil, err
+		}
+		defer nsHdlr.Close()
+		config.NetNS = int(nsHdlr.Fd())
+	}
+	rtnl, err := tc.Open(config)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := rtnl.Close(); err != nil {
+			log.Warnf("could not close rtnetlink socket: %v", err)
+		}
+	}()
+
+	queryMsg := &tc.Msg{
+		Family:  unix.AF_UNSPEC,
+		Ifindex: ifindex,
+	}
+	if direction == "ingress" {
+		queryMsg.Parent = core.BuildHandle(tc.HandleRoot, tc.HandleMinIngress)
+	} else {
+		queryMsg.Parent = core.BuildHandle(tc.HandleRoot, tc.HandleMinEgress)
+	}
+	return rtnl.Filter().Get(queryMsg)
+}
+
+func (r *RedirectServer) detachTC(namespace string, ifindex uint32, direction, name string) error {
+	config := &tc.Config{}
+	if namespace != "" {
+		nsHdlr, err := ns.GetNS(fmt.Sprintf("/var/run/netns/%s", namespace))
+		if err != nil {
+			return err
+		}
+		defer nsHdlr.Close()
+		config.NetNS = int(nsHdlr.Fd())
+	}
+	rtnl, err := tc.Open(config)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := rtnl.Close(); err != nil {
+			log.Warnf("could not close rtnetlink socket: %v", err)
+		}
+	}()
+
+	objs, err := r.getTCFilters(namespace, ifindex, direction)
+	if err != nil {
+		return err
+	}
+	matchedIndices := []int{}
+	for i, obj := range objs {
+		if obj.Msg.Handle == 0 {
+			continue
+		}
+		if obj.Attribute.Kind == "bpf" && obj.Attribute.BPF != nil &&
+			obj.Attribute.BPF.Name != nil && *obj.Attribute.BPF.Name == name {
+			matchedIndices = append(matchedIndices, i)
+		}
+	}
+	if len(matchedIndices) == 0 {
+		log.Debugf("No %s filter %s  matched for ifindex(%d)", direction, name, ifindex)
+	}
+
+	for _, idx := range matchedIndices {
+		if err := rtnl.Filter().Delete(&objs[idx]); err != nil {
+			log.Errorf("fail to delete filter: %v", err)
 		}
 	}
 	return nil

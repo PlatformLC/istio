@@ -132,34 +132,34 @@ int app_outbound(struct __sk_buff *skb)
     __u32 *log_level = get_log_level();
 
     if (!zi || zi->ifindex == 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     capture_dns = zi->flag & CAPTURE_DNS_FLAG;
 
     if (data + sizeof(*eth) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     // TODO: support ipv6
     if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     iph = data + sizeof(*eth);
     if (data + sizeof(*eth) + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     host_info = get_host_ip(0);
     if (host_info && host_info->addr[3] == iph->daddr)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     if (!capture_dns && iph->protocol == IPPROTO_UDP) {
         if (data + sizeof(*eth) + sizeof(*iph) + sizeof(*udph) > data_end)
-            return TC_ACT_OK;
+            return TC_ACT_PIPE;
         udph = data + sizeof(*eth) + sizeof(*iph);
         if (udph->dest == bpf_htons(UDP_P_DNS))
-            return TC_ACT_OK;
+            return TC_ACT_PIPE;
     }
 
     __builtin_memcpy(eth->h_dest, zi->mac_addr, ETH_ALEN);
@@ -184,39 +184,39 @@ int app_inbound(struct __sk_buff *skb)
     __u32 *log_level = get_log_level();
 
     if (skb->cb[4] == BYPASS_CB)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     if (data + sizeof(*eth) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     // TODO: support ipv6
     if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     iph = data + sizeof(*eth);
     if (data + sizeof(*eth) + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     host_info = get_host_ip(0);
     if (host_info && host_info->addr[3] == iph->saddr)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     zi = get_ztunnel_info();
 
     if (!zi || zi->ifindex == 0) {
         dbg("inbound_to_ztunnel unable to retrieve ztunnel_info\n");
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     }
 
     if (iph->protocol == IPPROTO_UDP) {
         if (data + sizeof(*eth) + sizeof(*iph) + sizeof(*udph) > data_end)
-            return TC_ACT_OK;
+            return TC_ACT_PIPE;
         udph = data + sizeof(*eth) + sizeof(*iph);
         if (udph->source == bpf_htons(UDP_P_DNS))
-            return TC_ACT_OK;
+            return TC_ACT_PIPE;
     }
 
     __builtin_memcpy(eth->h_dest, zi->mac_addr, ETH_ALEN);
@@ -239,24 +239,24 @@ int ztunnel_host_ingress(struct __sk_buff *skb)
     __u32 *log_level = get_log_level();
 
     if (data + sizeof(*eth) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     // TODO: support ipv6
     if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     iph = data + sizeof(*eth);
     if (data + sizeof(*eth) + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     pi = get_app_info_from_ipv4(iph->daddr);
     if (!pi) {
         // ip is not in ambient managed mesh
         // dbg("ztunnel_host_ingress unable to retrieve pod info: 0x%x\n", bpf_ntohl(iph->daddr));
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     }
 
     __builtin_memcpy(eth->h_dest, pi->mac_addr, ETH_ALEN);
@@ -281,18 +281,18 @@ int ztunnel_ingress(struct __sk_buff *skb)
     __u32 *log_level = get_log_level();
 
     if (data + sizeof(*eth) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     struct iphdr *iph = data + sizeof(*eth);
     if (data + sizeof(*eth) + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     // TODO: support UDP tunneling
     if (iph->protocol != IPPROTO_TCP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     tuple = (struct bpf_sock_tuple *)&iph->saddr;
     tuple_len = sizeof(tuple->ipv4);
@@ -332,7 +332,7 @@ int ztunnel_ingress(struct __sk_buff *skb)
         }
     }
 
-    return TC_ACT_OK;
+    return TC_ACT_PIPE;
 }
 
 char __license[] SEC("license") = "Dual BSD/GPL";

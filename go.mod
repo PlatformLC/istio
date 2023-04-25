@@ -19,6 +19,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.2.0
 	github.com/census-instrumentation/opencensus-proto v0.4.1
 	github.com/cheggaaa/pb/v3 v3.1.2
+	github.com/cilium/cilium v1.13.2
 	github.com/cilium/ebpf v0.10.0
 	github.com/cncf/xds/go v0.0.0-20230310173818-32f1caf87195
 	github.com/containernetworking/cni v1.1.2
@@ -69,7 +70,7 @@ require (
 	github.com/spf13/cobra v1.7.0
 	github.com/spf13/pflag v1.0.5
 	github.com/spf13/viper v1.15.0
-	github.com/vishvananda/netlink v1.2.1-beta.2
+	github.com/vishvananda/netlink v1.2.1-beta.2.0.20220608195807-1a118fe229fc
 	github.com/yl2chen/cidranger v1.0.2
 	go.opencensus.io v0.24.0
 	go.opentelemetry.io/proto/otlp v0.19.0
@@ -113,11 +114,31 @@ require (
 	cloud.google.com/go/longrunning v0.4.1 // indirect
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df // indirect
 	github.com/go-jose/go-jose/v3 v3.0.0 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-ole/go-ole v1.2.6 // indirect
+	github.com/go-openapi/analysis v0.21.4 // indirect
+	github.com/go-openapi/errors v0.20.3 // indirect
+	github.com/go-openapi/loads v0.21.2 // indirect
+	github.com/go-openapi/runtime v0.25.0 // indirect
+	github.com/go-openapi/spec v0.20.8 // indirect
+	github.com/go-openapi/strfmt v0.21.3 // indirect
+	github.com/go-openapi/validate v0.22.1 // indirect
 	github.com/google/s2a-go v0.1.0 // indirect
+	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
+	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/onsi/ginkgo/v2 v2.9.2 // indirect
+	github.com/opentracing/opentracing-go v1.2.1-0.20220228012449-10b1cf09e00b // indirect
+	github.com/petermattis/goid v0.0.0-20180202154549-b0b1615b78e5 // indirect
+	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
 	github.com/quic-go/qpack v0.4.0 // indirect
 	github.com/quic-go/qtls-go1-19 v0.2.1 // indirect
 	github.com/quic-go/qtls-go1-20 v0.1.1 // indirect
+	github.com/sasha-s/go-deadlock v0.3.1 // indirect
+	github.com/shirou/gopsutil/v3 v3.22.10 // indirect
+	github.com/yusufpapurcu/wmi v1.2.2 // indirect
+	go.mongodb.org/mongo-driver v1.11.2 // indirect
+	go.opentelemetry.io/otel v1.14.0 // indirect
+	go.opentelemetry.io/otel/trace v1.14.0 // indirect
 	go.uber.org/multierr v1.8.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
@@ -226,7 +247,7 @@ require (
 	github.com/stretchr/testify v1.8.2 // indirect
 	github.com/subosito/gotenv v1.4.2 // indirect
 	github.com/vbatts/tar-split v0.11.2 // indirect
-	github.com/vishvananda/netns v0.0.0-20210104183010-2eb08e3e575f // indirect
+	github.com/vishvananda/netns v0.0.0-20211101163701-50045581ed74 // indirect
 	github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb // indirect
 	github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415 // indirect
 	github.com/xeipuuv/gojsonschema v1.2.0 // indirect

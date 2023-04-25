@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 
+	cilbpf "github.com/cilium/cilium/pkg/bpf"
+	cilmap "github.com/cilium/cilium/pkg/maps/lxcmap"
 	netns "github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -101,6 +103,7 @@ func (s *Server) updateNodeProxyEBPF(pod *corev1.Pod, captureDNS bool) error {
 	veth, err := getVethWithDestinationOf(ip)
 	if err != nil {
 		log.Warnf("failed to get device: %v", err)
+		return err
 	}
 	peerIndex, err := getPeerIndex(veth)
 	if err != nil {
@@ -212,12 +215,38 @@ func getLinkWithDestinationOf(ip string) (netlink.Link, error) {
 		return nil, err
 	}
 
+	// FIXME: need a arbiter to switch the method of geting ifIndex
 	if len(routes) == 0 {
+		if link, err := getLinkWithIPFromCilium(ip); err == nil {
+			return link, nil
+		} else {
+			log.Infof("fail to get link for cilium: %v", err)
+		}
 		return nil, fmt.Errorf("no routes found for %s", ip)
 	}
 
 	linkIndex := routes[0].LinkIndex
 	return netlink.LinkByIndex(linkIndex)
+}
+
+func getLinkWithIPFromCilium(ip string) (netlink.Link, error) {
+	// TODO: https://github.com/cilium/cilium/pull/23634 has removed probe(some apis depend on 'bpftool' cmd) in map package.
+	// After cilium release including this patch, we could use map's opeation with cilium/pkg/maps/lxcmap directly.
+	key := cilmap.NewEndpointKey(net.ParseIP(ip))
+	lxcMap, err := cilbpf.OpenMap(cilmap.MapName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open cilium LXCmap")
+	}
+	defer lxcMap.Close()
+	value, err := lxcMap.Lookup(key)
+	if err != nil {
+		return nil, err
+	}
+	epInfo, ok := value.(*cilmap.EndpointInfo)
+	if !ok {
+		return nil, fmt.Errorf("cilium LXCmap value type unmatched")
+	}
+	return netlink.LinkByIndex(int(epInfo.IfIndex))
 }
 
 func getVethWithDestinationOf(ip string) (*netlink.Veth, error) {
