@@ -58,8 +58,8 @@ const (
 	CaptureDNSFlag      = uint8(1 << 0)
 
 	QdiscKind            = "clsact"
-	TcaBpfFlagActDiretct = 1 << 0 // refer to include/uapi/linux/pkt_cls.h TCA_BPF_FLAG_ACT_DIRECT
-	TcPrioFilter         = 1      // refer to include/uapi/linux/pkt_sched.h TC_PRIO_FILLER
+	TcaBpfFlagActDiretct = uint32(1 << 0) // refer to include/uapi/linux/pkt_cls.h TCA_BPF_FLAG_ACT_DIRECT
+	TcPrioFilter         = 1              // refer to include/uapi/linux/pkt_sched.h TC_PRIO_FILLER
 )
 
 const (
@@ -69,6 +69,13 @@ const (
 )
 
 var isBigEndian = native.IsBigEndian
+
+type TCFilterDir string
+
+const (
+	IngressDir TCFilterDir = "ingress"
+	EgressDir  TCFilterDir = "egress"
+)
 
 type RedirectServer struct {
 	redirectArgsChan           chan *RedirectArgs
@@ -394,88 +401,66 @@ func (r *RedirectServer) AcceptRequest(redirectArgs *RedirectArgs) {
 
 func (r *RedirectServer) attachTCForZtunnel(ifindex, peerIndex uint32, namespace string) error {
 	// attach to ztunnel host veth's ingress
-	if err := r.attachTC("", ifindex, "ingress", r.ztunnelHostingressFd, r.ztunnelHostingressProgName); err != nil {
+	if err := r.attachTC(ifindex, IngressDir, r.ztunnelHostingressFd, r.ztunnelHostingressProgName); err != nil {
 		return err
 	}
 	// attach to ztunnel veth's ingress in POD namespace
-	if err := r.attachTC(namespace, peerIndex, "ingress", r.ztunnelIngressFd, r.ztunnelIngressProgName); err != nil {
+	if err := ns.WithNetNSPath(fmt.Sprintf("/var/run/netns/%s", namespace), func(ns.NetNS) error {
+		if err := r.attachTC(peerIndex, IngressDir, r.ztunnelIngressFd, r.ztunnelIngressProgName); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (r *RedirectServer) delQdiscIfNeeded(namespace string, ifindex uint32) error {
-	objs, err := r.getTCFilters(namespace, ifindex, "ingress")
-	if err != nil {
-		return err
-	}
-	if len(objs) > 0 {
-		log.Debugf("Ifindex %d still has other ingress filters, will not remove the clsact qdisc", ifindex)
-		return nil
-	}
-
-	objs, err = r.getTCFilters(namespace, ifindex, "egress")
-	if err != nil {
-		return err
-	}
-
-	if len(objs) > 0 {
-		log.Debugf("Ifindex %d still has other egress filters, will not remove the clsact qdisc", ifindex)
-		return nil
-	}
-
-	// no filter exists, delete clsact qdisc
-	return r.delClsactQdisc(namespace, ifindex)
-}
 func (r *RedirectServer) detachTCForZtunnel(ifindex, peerIndex uint32, namespace string) error {
-	if err := r.detachTC("", ifindex, "ingress", r.ztunnelHostingressProgName); err != nil {
+	if err := r.detachTC(ifindex, IngressDir, r.ztunnelHostingressProgName); err != nil {
 		return fmt.Errorf("failed to detach TC ingress for ztunnel %d: %v", ifindex, err)
 	}
 
-	if err := r.detachTC(namespace, peerIndex, "ingress", r.ztunnelIngressProgName); err != nil {
-		return fmt.Errorf("failed to detach TC ingress for ztunnel %d(%s): %v", peerIndex, namespace, err)
-	}
-
-	if err := r.delQdiscIfNeeded("", ifindex); err != nil {
+	if err := r.delQdiscIfNeeded(ifindex); err != nil {
 		return err
 	}
-	return r.delQdiscIfNeeded(namespace, peerIndex)
+
+	if err := ns.WithNetNSPath(fmt.Sprintf("/var/run/netns/%s", namespace), func(ns.NetNS) error {
+		if err := r.detachTC(peerIndex, IngressDir, r.ztunnelIngressProgName); err != nil {
+			return fmt.Errorf("failed to detach TC ingress for ztunnel %d(in pod ns): %v", peerIndex, err)
+		}
+		return r.delQdiscIfNeeded(peerIndex)
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *RedirectServer) detachTCForWorkload(ifindex uint32) error {
-	if err := r.detachTC("", ifindex, "ingress", r.outboundProgName); err != nil {
+	if err := r.detachTC(ifindex, IngressDir, r.outboundProgName); err != nil {
 		return fmt.Errorf("failed to detach TC ingress for IfIndex %d: %v", ifindex, err)
 	}
-	if err := r.detachTC("", ifindex, "egress", r.inboundProgName); err != nil {
+	if err := r.detachTC(ifindex, EgressDir, r.inboundProgName); err != nil {
 		return fmt.Errorf("failed to detach TC egress for IfIndex %d: %v", ifindex, err)
 	}
 
-	return r.delQdiscIfNeeded("", ifindex)
+	return r.delQdiscIfNeeded(ifindex)
 }
 
 func (r *RedirectServer) attachTCForWorkLoad(ifindex uint32) error {
 	// attach to workload host veth's egress
-	if err := r.attachTC("", ifindex, "egress", r.inboundFd, r.inboundProgName); err != nil {
+	if err := r.attachTC(ifindex, EgressDir, r.inboundFd, r.inboundProgName); err != nil {
 		return err
 	}
 	// attach to workload host veth's ingress
-	if err := r.attachTC("", ifindex, "ingress", r.outboundFd, r.outboundProgName); err != nil {
+	if err := r.attachTC(ifindex, IngressDir, r.outboundFd, r.outboundProgName); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (r *RedirectServer) attachTC(namespace string, ifindex uint32, direction string, fd uint32, name string) error {
-	config := &tc.Config{}
-	if namespace != "" {
-		nsHdlr, err := ns.GetNS(fmt.Sprintf("/var/run/netns/%s", namespace))
-		if err != nil {
-			return err
-		}
-		defer nsHdlr.Close()
-		config.NetNS = int(nsHdlr.Fd())
-	}
-	rtnl, err := tc.Open(config)
+func (r *RedirectServer) attachTC(ifindex uint32, direction TCFilterDir, fd uint32, name string) error {
+	rtnl, err := tc.Open(&tc.Config{})
 	if err != nil {
 		return err
 	}
@@ -501,75 +486,43 @@ func (r *RedirectServer) attachTC(namespace string, ifindex uint32, direction st
 		log.Warnf("could not create %s qdisc to %d: %v", QdiscKind, ifindex, err)
 		return err
 	}
-
-	flag := uint32(TcaBpfFlagActDiretct)
-	// Attach ingress program
-	if direction == "ingress" {
-		filterIngress := tc.Object{
-			Msg: tc.Msg{
-				Family:  unix.AF_UNSPEC,
-				Ifindex: ifindex,
-				Handle:  1,
-				Parent:  core.BuildHandle(tc.HandleRoot, tc.HandleMinIngress),
-				// Info definition and usage could be referred from net/sched/cls_api.c 'tc_new_tfilter'
-				// higher 16bits are used as priority, lower 16bits are used as protocol
-				// refer include/net/sch_generic.h
-				// prio is define as 'u32' while protocol is '__be16'. :(
-				Info: core.BuildHandle(uint32(TcPrioFilter), uint32(htons(unix.ETH_P_ALL))),
+	flag := TcaBpfFlagActDiretct
+	filter := tc.Object{
+		Msg: tc.Msg{
+			Family:  unix.AF_UNSPEC,
+			Ifindex: ifindex,
+			Handle:  1,
+			// Info definition and usage could be referred from net/sched/cls_api.c 'tc_new_tfilter'
+			// higher 16bits are used as priority, lower 16bits are used as protocol
+			// refer include/net/sch_generic.h
+			// prio is define as 'u32' while protocol is '__be16'. :(
+			Info: core.BuildHandle(uint32(TcPrioFilter), uint32(htons(unix.ETH_P_ALL))),
+		},
+		Attribute: tc.Attribute{
+			Kind: "bpf",
+			BPF: &tc.Bpf{
+				FD:    &fd,
+				Name:  &name,
+				Flags: &flag,
 			},
-			Attribute: tc.Attribute{
-				Kind: "bpf",
-				BPF: &tc.Bpf{
-					FD:    &fd,
-					Name:  &name,
-					Flags: &flag,
-				},
-			},
-		}
-		if err := rtnl.Filter().Add(&filterIngress); err != nil && !errors.Is(err, os.ErrExist) {
-			log.Warnf("could not attach ingress eBPF: %v\n", err)
-			return err
-		}
+		},
 	}
-	// Attach egress program
-	if direction == "egress" {
-		filterEgress := tc.Object{
-			Msg: tc.Msg{
-				Family:  unix.AF_UNSPEC,
-				Ifindex: ifindex,
-				Handle:  1,
-				Parent:  core.BuildHandle(tc.HandleRoot, tc.HandleMinEgress),
-				Info:    core.BuildHandle(uint32(TcPrioFilter), uint32(htons(unix.ETH_P_ALL))),
-			},
-			Attribute: tc.Attribute{
-				Kind: "bpf",
-				BPF: &tc.Bpf{
-					FD:    &fd,
-					Name:  &name,
-					Flags: &flag,
-				},
-			},
-		}
+	switch direction {
+	case IngressDir:
+		filter.Msg.Parent = core.BuildHandle(tc.HandleRoot, tc.HandleMinIngress)
+	case EgressDir:
+		filter.Msg.Parent = core.BuildHandle(tc.HandleRoot, tc.HandleMinEgress)
+	}
 
-		if err := rtnl.Filter().Add(&filterEgress); err != nil && !errors.Is(err, os.ErrExist) {
-			log.Warnf("could not attach egress eBPF: %v", err)
-			return err
-		}
+	if err := rtnl.Filter().Add(&filter); err != nil && !errors.Is(err, os.ErrExist) {
+		log.Warnf("could not attach %s eBPF: %v\n", direction, err)
+		return err
 	}
 	return nil
 }
 
-func (r *RedirectServer) getTCFilters(namespace string, ifindex uint32, direction string) ([]tc.Object, error) {
-	config := &tc.Config{}
-	if namespace != "" {
-		nsHdlr, err := ns.GetNS(fmt.Sprintf("/var/run/netns/%s", namespace))
-		if err != nil {
-			return nil, err
-		}
-		defer nsHdlr.Close()
-		config.NetNS = int(nsHdlr.Fd())
-	}
-	rtnl, err := tc.Open(config)
+func (r *RedirectServer) getTCFilters(ifindex uint32, direction TCFilterDir) ([]tc.Object, error) {
+	rtnl, err := tc.Open(&tc.Config{})
 	if err != nil {
 		return nil, err
 	}
@@ -583,25 +536,17 @@ func (r *RedirectServer) getTCFilters(namespace string, ifindex uint32, directio
 		Family:  unix.AF_UNSPEC,
 		Ifindex: ifindex,
 	}
-	if direction == "ingress" {
+	switch direction {
+	case IngressDir:
 		queryMsg.Parent = core.BuildHandle(tc.HandleRoot, tc.HandleMinIngress)
-	} else {
+	case EgressDir:
 		queryMsg.Parent = core.BuildHandle(tc.HandleRoot, tc.HandleMinEgress)
 	}
 	return rtnl.Filter().Get(queryMsg)
 }
 
-func (r *RedirectServer) detachTC(namespace string, ifindex uint32, direction, name string) error {
-	config := &tc.Config{}
-	if namespace != "" {
-		nsHdlr, err := ns.GetNS(fmt.Sprintf("/var/run/netns/%s", namespace))
-		if err != nil {
-			return err
-		}
-		defer nsHdlr.Close()
-		config.NetNS = int(nsHdlr.Fd())
-	}
-	rtnl, err := tc.Open(config)
+func (r *RedirectServer) detachTC(ifindex uint32, direction TCFilterDir, name string) error {
+	rtnl, err := tc.Open(&tc.Config{})
 	if err != nil {
 		return err
 	}
@@ -611,7 +556,7 @@ func (r *RedirectServer) detachTC(namespace string, ifindex uint32, direction, n
 		}
 	}()
 
-	objs, err := r.getTCFilters(namespace, ifindex, direction)
+	objs, err := r.getTCFilters(ifindex, direction)
 	if err != nil {
 		return err
 	}
@@ -626,7 +571,7 @@ func (r *RedirectServer) detachTC(namespace string, ifindex uint32, direction, n
 		}
 	}
 	if len(matchedIndices) == 0 {
-		log.Debugf("No %s filter %s  matched for ifindex(%d)", direction, name, ifindex)
+		log.Debugf("No filter %s matched for ifindex(%d)", name, ifindex)
 	}
 
 	for _, idx := range matchedIndices {
@@ -637,17 +582,32 @@ func (r *RedirectServer) detachTC(namespace string, ifindex uint32, direction, n
 	return nil
 }
 
-func (r *RedirectServer) delClsactQdisc(namespace string, ifindex uint32) error {
-	config := &tc.Config{}
-	if namespace != "" {
-		nsHdlr, err := ns.GetNS(fmt.Sprintf("/var/run/netns/%s", namespace))
-		if err != nil {
-			return err
-		}
-		defer nsHdlr.Close()
-		config.NetNS = int(nsHdlr.Fd())
+func (r *RedirectServer) delQdiscIfNeeded(ifindex uint32) error {
+	objs, err := r.getTCFilters(ifindex, IngressDir)
+	if err != nil {
+		return err
 	}
-	rtnl, err := tc.Open(config)
+	if len(objs) > 0 {
+		log.Debugf("Ifindex %d still has other ingress filters, will not remove the clsact qdisc", ifindex)
+		return nil
+	}
+
+	objs, err = r.getTCFilters(ifindex, EgressDir)
+	if err != nil {
+		return err
+	}
+
+	if len(objs) > 0 {
+		log.Debugf("Ifindex %d still has other egress filters, will not remove the clsact qdisc", ifindex)
+		return nil
+	}
+
+	// no filter exists, delete clsact qdisc
+	return r.delClsactQdisc(ifindex)
+}
+
+func (r *RedirectServer) delClsactQdisc(ifindex uint32) error {
+	rtnl, err := tc.Open(&tc.Config{})
 	if err != nil {
 		return err
 	}

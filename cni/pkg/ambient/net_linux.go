@@ -231,7 +231,7 @@ func getLinkWithDestinationOf(ip string) (netlink.Link, error) {
 
 func getLinkWithIPFromCilium(ip string) (netlink.Link, error) {
 	// TODO: https://github.com/cilium/cilium/pull/23634 has removed probe(some apis depend on 'bpftool' cmd) in map package.
-	// After cilium release including this patch, we could use map's opeation with cilium/pkg/maps/lxcmap directly.
+	// After cilium release including this patch, we could use map's operation with cilium/pkg/maps/lxcmap directly.
 	key := cilmap.NewEndpointKey(net.ParseIP(ip))
 	lxcMap, err := cilbpf.OpenMap(cilmap.MapName)
 	if err != nil {
