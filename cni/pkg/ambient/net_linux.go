@@ -207,10 +207,17 @@ func (s *Server) delPodEbpfOnNode(ip string, force bool) error {
 	return nil
 }
 
-func getLinkWithDestinationOf(ip string) (netlink.Link, error) {
+func getLinkWithDestinationOf(ipStr string) (netlink.Link, error) {
+	family := netlink.FAMILY_V4
+	mask := net.CIDRMask(32, 32)
+	ip := net.ParseIP(ipStr)
+	if ip.To4() == nil {
+		family = netlink.FAMILY_V6
+		mask = net.CIDRMask(128, 128)
+	}
 	routes, err := netlink.RouteListFiltered(
-		netlink.FAMILY_V4,
-		&netlink.Route{Dst: &net.IPNet{IP: net.ParseIP(ip), Mask: net.CIDRMask(32, 32)}},
+		family,
+		&netlink.Route{Dst: &net.IPNet{IP: ip, Mask: mask}},
 		netlink.RT_FILTER_DST)
 	if err != nil {
 		return nil, err
@@ -801,8 +808,7 @@ func (s *Server) CreateEBPFRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP,
 		// In routing table ${INBOUND_TPROXY_ROUTE_TABLE}, create a single default rule to route all traffic to
 		// the loopback interface.
 		// Equiv: "ip route add local 0.0.0.0/0 dev lo table 100"
-		// TODO IPv6, append "0::0/0"
-		cidrs := []string{"0.0.0.0/0"}
+		cidrs := []string{"0.0.0.0/0", "::/0"}
 		for _, fullCIDR := range cidrs {
 			_, dst, err := net.ParseCIDR(fullCIDR)
 			if err != nil {
@@ -856,7 +862,15 @@ func (s *Server) createTProxyRulesForLegacyEBPF(ztunnelIP, ifName string) error 
 	if err != nil {
 		return fmt.Errorf("failed to configure iptables rule: %v", err)
 	}
-
+	err = execute(s.Ip6tablesCmd(), "-t", "mangle", "-F", "PREROUTING")
+	if err != nil {
+		return fmt.Errorf("failed to configure ip6tables rule: %v", err)
+	}
+	isIPv4 := net.ParseIP(ztunnelIP).To4() != nil
+	loopbackAdd := "127.0.0.1"
+	if !isIPv4 {
+		loopbackAdd = "::1"
+	}
 	// Set up append rules
 	appendRules := []*iptablesRule{
 		// Set eBPF mark on inbound packets
@@ -871,7 +885,7 @@ func (s *Server) createTProxyRulesForLegacyEBPF(ztunnelIP, ifName string) error 
 			"-j", "TPROXY",
 			"--tproxy-mark", fmt.Sprintf("0x%x", constants.TProxyMark)+"/"+fmt.Sprintf("0x%x", constants.TProxyMask),
 			"--on-port", fmt.Sprintf("%d", constants.ZtunnelInboundPort),
-			"--on-ip", "127.0.0.1",
+			"--on-ip", loopbackAdd,
 		),
 		// Same mark, but on plaintext port
 		newIptableRule(
@@ -883,7 +897,7 @@ func (s *Server) createTProxyRulesForLegacyEBPF(ztunnelIP, ifName string) error 
 			"-j", "TPROXY",
 			"--tproxy-mark", fmt.Sprintf("0x%x", constants.TProxyMark)+"/"+fmt.Sprintf("0x%x", constants.TProxyMask),
 			"--on-port", fmt.Sprintf("%d", constants.ZtunnelInboundPlaintextPort),
-			"--on-ip", "127.0.0.1",
+			"--on-ip", loopbackAdd,
 		),
 		// Set outbound eBPF mark
 		newIptableRule(
@@ -895,7 +909,7 @@ func (s *Server) createTProxyRulesForLegacyEBPF(ztunnelIP, ifName string) error 
 			"-j", "TPROXY",
 			"--tproxy-mark", fmt.Sprintf("0x%x", constants.TProxyMark)+"/"+fmt.Sprintf("0x%x", constants.TProxyMask),
 			"--on-port", fmt.Sprintf("%d", constants.ZtunnelOutboundPort),
-			"--on-ip", "127.0.0.1",
+			"--on-ip", loopbackAdd,
 		),
 		// For anything NOT going to the ztunnel IP, add the OrgSrcRet mark
 		newIptableRule(
@@ -909,8 +923,14 @@ func (s *Server) createTProxyRulesForLegacyEBPF(ztunnelIP, ifName string) error 
 			"--set-mark", fmt.Sprintf("0x%x", constants.OrgSrcRetMark)+"/"+fmt.Sprintf("0x%x", constants.OrgSrcRetMask),
 		),
 	}
-	if err := s.iptablesAppend(appendRules); err != nil {
-		return fmt.Errorf("failed to append iptables rule: %v", err)
+	if isIPv4 {
+		if err := s.iptablesAppend(appendRules); err != nil {
+			return fmt.Errorf("failed to append iptables rule: %v", err)
+		}
+	} else {
+		if err := s.ip6tablesAppend(appendRules); err != nil {
+			return fmt.Errorf("failed to append iptables rule: %v", err)
+		}
 	}
 
 	return nil
@@ -1253,8 +1273,7 @@ func (s *Server) getEnrolledIPSets() sets.Set[string] {
 func addTProxyMarkRule() error {
 	// Set up tproxy marks
 	var rules []*netlink.Rule
-	// TODO IPv6, append  unix.AF_INET6
-	families := []int{unix.AF_INET}
+	families := []int{unix.AF_INET, unix.AF_INET6}
 	for _, family := range families {
 		// Equiv: "ip rule add priority 20000 fwmark 0x400/0xfff lookup 100"
 		tproxMarkRule := netlink.NewRule()
@@ -1279,8 +1298,7 @@ func addTProxyMarkRule() error {
 func addOrgSrcMarkRule() error {
 	// Set up tproxy marks
 	var rules []*netlink.Rule
-	// TODO IPv6, append  unix.AF_INET6
-	families := []int{unix.AF_INET}
+	families := []int{unix.AF_INET, unix.AF_INET6}
 	for _, family := range families {
 		// Equiv: "ip rule add priority 20003 fwmark 0x4d3/0xfff lookup 100"
 		orgSrcRule := netlink.NewRule()
@@ -1359,6 +1377,10 @@ func routeFlushTable(table int) error {
 	if err != nil {
 		return err
 	}
+	routesV6, err := netlink.RouteListFiltered(netlink.FAMILY_V6, &netlink.Route{Table: table}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return err
+	}
 	// default route is not handled proper in netlink
 	// https://github.com/vishvananda/netlink/issues/670
 	// https://github.com/vishvananda/netlink/issues/611
@@ -1368,6 +1390,13 @@ func routeFlushTable(table int) error {
 			routes[i].Dst = defaultDst
 		}
 	}
+	for i, route := range routesV6 {
+		if (route.Dst == nil || route.Dst.IP == nil) && route.Src == nil && route.Gw == nil && route.MPLSDst == nil {
+			_, defaultDst, _ := net.ParseCIDR("::/0")
+			routes[i].Dst = defaultDst
+		}
+	}
+	routes = append(routes, routesV6...)
 	err = routesDelete(routes)
 	if err != nil {
 		return err
@@ -1384,6 +1413,7 @@ func deleteIPRules(prioritiesToDelete []string, warnOnFail bool) {
 	var exec []*ExecList
 	for _, pri := range prioritiesToDelete {
 		exec = append(exec, newExec("ip", []string{"rule", "del", "priority", pri}))
+		exec = append(exec, newExec("ip", []string{"-6", "rule", "del", "priority", pri}))
 	}
 	for _, e := range exec {
 		err := execute(e.Cmd, e.Args...)

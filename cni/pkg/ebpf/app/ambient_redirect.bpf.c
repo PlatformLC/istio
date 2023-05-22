@@ -47,7 +47,7 @@ struct {
 |--------------------------------------------------------------|
 |  0          |        ::ffff:192.0.2.1                        |
 |--------------------------------------------------------------|
-|  1          |        2001:db8:::1234                         |
+|  1          |        2001:db8::1234                          |
 |--------------------------------------------------------------|
 */
 
@@ -79,6 +79,25 @@ struct {
 |--------------------------------------------------------------------------|
 |  key(pod IP)         |        Val(app info: ifindex, mac address)        |
 |--------------------------------------------------------------------------|
+|  2001:db8::1234      |        2, 00:11:22:33:44:aa                       |
+|--------------------------------------------------------------------------|
+|  2001:db8::4567      |        3, 00:11:22:33:44:bb                       |
+|--------------------------------------------------------------------------|
+*/
+
+struct {
+        __uint(type, BPF_MAP_TYPE_HASH);
+        __uint(max_entries, APP_INFO_MAP_SIZE);
+        __type(key, struct in6_addr);
+        __type(value, struct app_info);
+        __uint(pinning, LIBBPF_PIN_BY_NAME);
+} app_info_ipv6 SEC(".maps");
+
+
+/* This is a hash map to store current application info
+|--------------------------------------------------------------------------|
+|  key(pod IP)         |        Val(app info: ifindex, mac address)        |
+|--------------------------------------------------------------------------|
 |  10.101.1.2          |        2, 00:11:22:33:44:aa                       |
 |--------------------------------------------------------------------------|
 |  10.101.2.2          |        3, 00:11:22:33:44:bb                       |
@@ -105,6 +124,10 @@ static __inline struct app_info * get_app_info_from_ipv4(__u32 ipv4)
     return bpf_map_lookup_elem(&app_info, &ipv4);
 }
 
+static __inline struct app_info * get_app_info_from_ipv6(struct in6_addr *ipv6)
+{
+    return bpf_map_lookup_elem(&app_info_ipv6, ipv6);
+}
 static __inline struct ztunnel_info * get_ztunnel_info()
 {
     uint32_t key = 0;
@@ -117,6 +140,64 @@ static __inline __u32 * get_log_level()
     return bpf_map_lookup_elem(&log_level, &key);
 }
 
+static __inline void ipv6_addr_copy(void *dst, void *src)
+{
+    __builtin_memcpy(dst, src, sizeof(struct in6_addr));
+}
+
+static __inline int ipv6_optlen(const struct ipv6_opt_hdr *opthdr)
+{
+    return (opthdr->hdrlen + 1) << 3;
+}
+
+static __inline int ipv6_authlen(const struct ipv6_opt_hdr *opthdr)
+{
+    return (opthdr->hdrlen + 2) << 2;
+}
+
+static __inline int ipv6_get_l4_offset(struct __sk_buff *skb, __u8 *nexthdr, int l3_offset)
+{
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    int i, len = l3_offset + sizeof(struct ipv6hdr);
+    struct ipv6_opt_hdr *opthdr;
+    __u8 nh = *nexthdr;
+
+// #pragma unroll
+    for (i = 0; i < IPV6_MAX_HEADERS; i++) {
+        switch (nh) {
+        case NEXTHDR_NONE:
+            return -1;
+
+        case NEXTHDR_FRAGMENT:
+            return -1;
+
+        case NEXTHDR_HOP:
+        case NEXTHDR_ROUTING:
+        case NEXTHDR_AUTH:
+        case NEXTHDR_DEST:
+            if (data + len + sizeof(*opthdr) > data_end)
+                return -1;
+            opthdr = data + len;
+
+            if (nh == NEXTHDR_AUTH)
+                len += ipv6_authlen(opthdr);
+            else
+                len += ipv6_optlen(opthdr);
+
+            nh = opthdr->nexthdr;
+            break;
+
+        default:
+            *nexthdr = nh;
+            return len;
+        }
+    }
+
+    /* Reached limit of supported extension headers */
+    return -1;
+}
+
 // For app pod veth pair(in host ns) ingress hook
 SEC("tc")
 int app_outbound(struct __sk_buff *skb)
@@ -125,6 +206,9 @@ int app_outbound(struct __sk_buff *skb)
     void *data_end = (void *)(long)skb->data_end;
     struct ethhdr *eth = data;
     struct iphdr *iph;
+    struct ipv6hdr *ip6h;
+    __u8 nexthdr;
+    int l4_offset;
     struct udphdr *udph;
     struct ztunnel_info *zi = get_ztunnel_info();
     uint8_t capture_dns = 0;
@@ -139,28 +223,61 @@ int app_outbound(struct __sk_buff *skb)
     if (data + sizeof(*eth) > data_end)
         return TC_ACT_OK;
 
-    // TODO: support ipv6
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+    switch (eth->h_proto) {
+        case bpf_htons(ETH_P_IP):
+            iph = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*iph) > data_end)
+                return TC_ACT_OK;
 
-    iph = data + sizeof(*eth);
-    if (data + sizeof(*eth) + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+            host_info = get_host_ip(0);
+            if (host_info && host_info->addr[3] == iph->daddr)
+                return TC_ACT_OK;
 
-    host_info = get_host_ip(0);
-    if (host_info && host_info->addr[3] == iph->daddr)
-        return TC_ACT_OK;
+            if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
+                return TC_ACT_OK;
 
-    if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-        return TC_ACT_OK;
+            if (!capture_dns && iph->protocol == IPPROTO_UDP) {
+                if (data + sizeof(*eth) + sizeof(*iph) + sizeof(*udph) > data_end)
+                    return TC_ACT_OK;
+                udph = data + sizeof(*eth) + sizeof(*iph);
+                if (udph->dest == bpf_htons(UDP_P_DNS))
+                    return TC_ACT_OK;
+            }
 
-    if (!capture_dns && iph->protocol == IPPROTO_UDP) {
-        if (data + sizeof(*eth) + sizeof(*iph) + sizeof(*udph) > data_end)
+            break;
+        case bpf_htons(ETH_P_IPV6):
+            ip6h = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*ip6h) > data_end)
+                return TC_ACT_OK;
+
+            host_info = get_host_ip(1);
+            if (host_info &&
+                host_info->addr[0] == ip6h->daddr.in6_u.u6_addr32[0] &&
+                host_info->addr[1] == ip6h->daddr.in6_u.u6_addr32[1] &&
+                host_info->addr[2] == ip6h->daddr.in6_u.u6_addr32[2] &&
+                host_info->addr[3] == ip6h->daddr.in6_u.u6_addr32[3])
+                return TC_ACT_OK;
+
+            nexthdr = ip6h->nexthdr;
+            l4_offset = ipv6_get_l4_offset(skb, &nexthdr, sizeof(*eth));
+            if (l4_offset < 0)
+                return TC_ACT_OK;
+
+            if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP)
+                return TC_ACT_OK;
+
+            if (!capture_dns && nexthdr == IPPROTO_UDP) {
+                if (data + l4_offset + sizeof(*udph) > data_end)
+                    return TC_ACT_OK;
+                udph = data + l4_offset;
+                if (udph->dest == bpf_htons(UDP_P_DNS))
+                    return TC_ACT_OK;
+            }
+
+            break;
+        default:
             return TC_ACT_OK;
-        udph = data + sizeof(*eth) + sizeof(*iph);
-        if (udph->dest == bpf_htons(UDP_P_DNS))
-            return TC_ACT_OK;
-    }
+    };
 
     __builtin_memcpy(eth->h_dest, zi->mac_addr, ETH_ALEN);
 
@@ -178,6 +295,9 @@ int app_inbound(struct __sk_buff *skb)
     void *data_end = (void *)(long)skb->data_end;
     struct ethhdr  *eth = data;
     struct iphdr *iph = NULL;
+    struct ipv6hdr *ip6h = NULL;
+    __u8 nexthdr;
+    int l4_offset;
     struct udphdr *udph;
     struct ztunnel_info *zi = NULL;
     struct host_info *host_info = NULL;
@@ -189,34 +309,66 @@ int app_inbound(struct __sk_buff *skb)
     if (data + sizeof(*eth) > data_end)
         return TC_ACT_OK;
 
-    // TODO: support ipv6
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+    switch (eth->h_proto) {
+        case bpf_htons(ETH_P_IP):
+            iph = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*iph) > data_end)
+                return TC_ACT_OK;
 
-    iph = data + sizeof(*eth);
-    if (data + sizeof(*eth) + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+            host_info = get_host_ip(0);
+            if (host_info && host_info->addr[3] == iph->saddr)
+                return TC_ACT_OK;
 
-    host_info = get_host_ip(0);
-    if (host_info && host_info->addr[3] == iph->saddr)
-        return TC_ACT_OK;
+            if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
+                return TC_ACT_OK;
 
-    if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-        return TC_ACT_OK;
+            if (iph->protocol == IPPROTO_UDP) {
+                if (data + sizeof(*eth) + sizeof(*iph) + sizeof(*udph) > data_end)
+                    return TC_ACT_OK;
+                udph = data + sizeof(*eth) + sizeof(*iph);
+                if (udph->source == bpf_htons(UDP_P_DNS))
+                    return TC_ACT_OK;
+            }
+
+            break;
+        case bpf_htons(ETH_P_IPV6):
+            ip6h = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*ip6h) > data_end)
+                return TC_ACT_OK;
+
+            host_info = get_host_ip(1);
+            if (host_info &&
+                host_info->addr[0] == ip6h->daddr.in6_u.u6_addr32[0] &&
+                host_info->addr[1] == ip6h->daddr.in6_u.u6_addr32[1] &&
+                host_info->addr[2] == ip6h->daddr.in6_u.u6_addr32[2] &&
+                host_info->addr[3] == ip6h->daddr.in6_u.u6_addr32[3])
+                return TC_ACT_OK;
+
+            nexthdr = ip6h->nexthdr;
+            l4_offset = ipv6_get_l4_offset(skb, &nexthdr, sizeof(*eth));
+            if (l4_offset < 0)
+                return TC_ACT_OK;
+
+            if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP)
+                return TC_ACT_OK;
+
+            if (nexthdr == IPPROTO_UDP) {
+                if (data + l4_offset + sizeof(*udph) > data_end)
+                    return TC_ACT_OK;
+                udph = data + l4_offset;
+                if (udph->source == bpf_htons(UDP_P_DNS))
+                    return TC_ACT_OK;
+            }
+            break;
+        default:
+            return TC_ACT_OK;
+    };
 
     zi = get_ztunnel_info();
 
     if (!zi || zi->ifindex == 0) {
         dbg("inbound_to_ztunnel unable to retrieve ztunnel_info\n");
         return TC_ACT_SHOT;
-    }
-
-    if (iph->protocol == IPPROTO_UDP) {
-        if (data + sizeof(*eth) + sizeof(*iph) + sizeof(*udph) > data_end)
-            return TC_ACT_OK;
-        udph = data + sizeof(*eth) + sizeof(*iph);
-        if (udph->source == bpf_htons(UDP_P_DNS))
-            return TC_ACT_OK;
     }
 
     __builtin_memcpy(eth->h_dest, zi->mac_addr, ETH_ALEN);
@@ -235,24 +387,45 @@ int ztunnel_host_ingress(struct __sk_buff *skb)
     struct ethhdr  *eth = data;
     void *data_end = (void *)(long)skb->data_end;
     struct iphdr *iph = NULL;
+    struct ipv6hdr *ip6h = NULL;
+    __u8 nexthdr;
+    int l4_offset;
     struct app_info *pi = NULL;
     __u32 *log_level = get_log_level();
 
     if (data + sizeof(*eth) > data_end)
         return TC_ACT_OK;
 
-    // TODO: support ipv6
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+    switch (eth->h_proto) {
+        case bpf_htons(ETH_P_IP):
+            iph = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*iph) > data_end)
+                return TC_ACT_OK;
 
-    iph = data + sizeof(*eth);
-    if (data + sizeof(*eth) + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+            if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
+                return TC_ACT_OK;
 
-    if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-        return TC_ACT_OK;
+            pi = get_app_info_from_ipv4(iph->daddr);
+            break;
+        case bpf_htons(ETH_P_IPV6):
+            ip6h = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*ip6h) > data_end)
+                return TC_ACT_OK;
 
-    pi = get_app_info_from_ipv4(iph->daddr);
+            nexthdr = ip6h->nexthdr;
+            l4_offset = ipv6_get_l4_offset(skb, &nexthdr, sizeof(*eth));
+            if (l4_offset < 0)
+                return TC_ACT_OK;
+
+            if (nexthdr != IPPROTO_TCP && nexthdr != IPPROTO_UDP)
+                return TC_ACT_OK;
+
+            pi = get_app_info_from_ipv6(&ip6h->daddr);
+            break;
+        default:
+            return TC_ACT_OK;
+    };
+
     if (!pi) {
         // ip is not in ambient managed mesh
         // dbg("ztunnel_host_ingress unable to retrieve pod info: 0x%x\n", bpf_ntohl(iph->daddr));
@@ -262,7 +435,7 @@ int ztunnel_host_ingress(struct __sk_buff *skb)
     __builtin_memcpy(eth->h_dest, pi->mac_addr, ETH_ALEN);
     skb->cb[4] = BYPASS_CB;
 
-    dbg("ztunnel redirect to app(0x%x) ifidx: %u\n", bpf_ntohl(iph->daddr), pi->ifindex);
+    dbg("ztunnel redirect to app ifidx: %u\n", pi->ifindex);
 
     return bpf_redirect(pi->ifindex, 0);
 }
@@ -272,9 +445,15 @@ SEC("tc")
 int ztunnel_ingress(struct __sk_buff *skb)
 {
     void *data = (void *)(long)skb->data;
-    struct ethhdr  *eth = data;
+    struct ethhdr *eth = data;
+    struct iphdr *iph = NULL;
+    struct ipv6hdr *ip6h = NULL;
+    struct tcphdr *tcph = NULL;
+    __u8 nexthdr;
+    int l4_offset;
     void *data_end = (void *)(long)skb->data_end;
     struct bpf_sock_tuple *tuple;
+    struct bpf_sock_tuple tmp_tup;
     size_t tuple_len;
     struct bpf_sock *sk;
     int skip_mark = 0;
@@ -286,21 +465,51 @@ int ztunnel_ingress(struct __sk_buff *skb)
     if (data + sizeof(*eth) > data_end)
         return TC_ACT_OK;
 
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+    switch (eth->h_proto) {
+        case bpf_htons(ETH_P_IP):
+            iph = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*iph) > data_end)
+                return TC_ACT_OK;
 
-    struct iphdr *iph = data + sizeof(*eth);
-    if (data + sizeof(*eth) + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+            // TODO: support UDP tunneling
+            if (iph->protocol != IPPROTO_TCP)
+                return TC_ACT_OK;
 
-    // TODO: support UDP tunneling
-    if (iph->protocol != IPPROTO_TCP)
-        return TC_ACT_OK;
+            tuple = (struct bpf_sock_tuple *)&iph->saddr;
+            tuple_len = sizeof(tuple->ipv4);
+            if ((void *)tuple + sizeof(tuple->ipv4) > (void *)(long)skb->data_end)
+                return TC_ACT_SHOT;
 
-    tuple = (struct bpf_sock_tuple *)&iph->saddr;
-    tuple_len = sizeof(tuple->ipv4);
-    if ((void *)tuple + sizeof(tuple->ipv4) > (void *)(long)skb->data_end)
-        return TC_ACT_SHOT;
+            break;
+        case bpf_htons(ETH_P_IPV6):
+            ip6h = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*ip6h) > data_end)
+                return TC_ACT_OK;
+
+            nexthdr = ip6h->nexthdr;
+            l4_offset = ipv6_get_l4_offset(skb, &nexthdr, sizeof(*eth));
+            if (l4_offset < 0)
+                return TC_ACT_OK;
+
+            // TODO: support UDP tunneling
+            if (nexthdr != IPPROTO_TCP)
+                return TC_ACT_OK;
+
+            if (data + l4_offset + sizeof(*tcph) > data_end)
+                return TC_ACT_OK;
+            tcph = data + l4_offset;
+
+            ipv6_addr_copy(tmp_tup.ipv6.daddr, &ip6h->daddr);
+            ipv6_addr_copy(tmp_tup.ipv6.saddr, &ip6h->saddr);
+            tmp_tup.ipv6.sport = tcph->source;
+            tmp_tup.ipv6.dport = tcph->dest;
+            tuple = &tmp_tup;
+            tuple_len = sizeof(tuple->ipv6);
+
+            break;
+        default:
+            return TC_ACT_OK;
+    };
 
     if (skb->cb[4] == OUTBOUND_CB) {
         // We mark all app egress pkt as outbound and redirect here.
@@ -344,14 +553,19 @@ SEC("tc")
 int ztunnel_tproxy(struct __sk_buff *skb)
 {
     void *data = (void *)(long)skb->data;
-    struct ethhdr  *eth = data;
+    struct ethhdr *eth = data;
+    struct iphdr *iph = NULL;
+    struct ipv6hdr *ip6h = NULL;
+    struct tcphdr *tcph = NULL;
+    __u8 nexthdr;
+    int l4_offset;
     void *data_end = (void *)(long)skb->data_end;
     struct bpf_sock_tuple *tuple;
     size_t tuple_len;
     struct bpf_sock *sk;
     __u32 *log_level = get_log_level();
     struct bpf_sock_tuple proxy_tup;
-    __be16 proxy_port;
+    __be16 proxy_port, dst_port;
     int ret;
 
     if (skb->cb[4] != OUTBOUND_CB && skb->cb[4] != INBOUND_CB)
@@ -360,21 +574,53 @@ int ztunnel_tproxy(struct __sk_buff *skb)
     if (data + sizeof(*eth) > data_end)
         return TC_ACT_OK;
 
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+    switch (eth->h_proto) {
+        case bpf_htons(ETH_P_IP):
+            iph = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*iph) > data_end)
+                return TC_ACT_OK;
 
-    struct iphdr *iph = data + sizeof(*eth);
-    if (data + sizeof(*eth) + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+            // TODO: support UDP tunneling
+            if (iph->protocol != IPPROTO_TCP)
+                return TC_ACT_OK;
 
-    // TODO: support UDP tunneling
-    if (iph->protocol != IPPROTO_TCP)
-        return TC_ACT_OK;
+            tuple = (struct bpf_sock_tuple *)&iph->saddr;
+            tuple_len = sizeof(tuple->ipv4);
+            if ((void *)tuple + sizeof(tuple->ipv4) > (void *)(long)skb->data_end)
+                return TC_ACT_SHOT;
 
-    tuple = (struct bpf_sock_tuple *)&iph->saddr;
-    tuple_len = sizeof(tuple->ipv4);
-    if ((void *)tuple + sizeof(tuple->ipv4) > (void *)(long)skb->data_end)
-        return TC_ACT_SHOT;
+            dst_port = tuple->ipv4.dport;
+            break;
+        case bpf_htons(ETH_P_IPV6):
+            ip6h = data + sizeof(*eth);
+            if (data + sizeof(*eth) + sizeof(*ip6h) > data_end)
+                return TC_ACT_OK;
+
+            nexthdr = ip6h->nexthdr;
+            l4_offset = ipv6_get_l4_offset(skb, &nexthdr, sizeof(*eth));
+            if (l4_offset < 0)
+                return TC_ACT_OK;
+
+            // TODO: support UDP tunneling
+            if (nexthdr != IPPROTO_TCP)
+                return TC_ACT_OK;
+
+            if (data + l4_offset + sizeof(*tcph) > data_end)
+                return TC_ACT_OK;
+            tcph = data + l4_offset;
+
+            ipv6_addr_copy(proxy_tup.ipv6.daddr, &ip6h->daddr);
+            ipv6_addr_copy(proxy_tup.ipv6.saddr, &ip6h->saddr);
+            proxy_tup.ipv6.sport = tcph->source;
+            proxy_tup.ipv6.dport = tcph->dest;
+            tuple = &proxy_tup;
+            tuple_len = sizeof(tuple->ipv6);
+            dst_port = tuple->ipv6.dport;
+
+            break;
+        default:
+            return TC_ACT_OK;
+    };
 
     sk = bpf_skc_lookup_tcp(skb, tuple, tuple_len, BPF_F_CURRENT_NETNS, 0);
     if (sk && sk->state == BPF_TCP_LISTEN) {
@@ -388,15 +634,18 @@ int ztunnel_tproxy(struct __sk_buff *skb)
         if (skb->cb[4] == OUTBOUND_CB) {
             proxy_port = bpf_htons(ZTUNNEL_OUTBOUND_PORT);
         } else {
-            if (tuple->ipv4.dport != bpf_htons(ZTUNNEL_INBOUND_PORT)) {
+            if (dst_port != bpf_htons(ZTUNNEL_INBOUND_PORT)) {
                 // for plaintext case
                 proxy_port = bpf_htons(ZTUNNEL_INBOUND_PLAINTEXT_PORT);
             } else {
                 proxy_port = bpf_htons(ZTUNNEL_INBOUND_PORT);
             }
         }
-
-        proxy_tup.ipv4.dport = proxy_port;
+        if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+            proxy_tup.ipv4.dport = proxy_port;
+        } else {
+            proxy_tup.ipv6.dport = proxy_port;
+        }
 
         sk = bpf_skc_lookup_tcp(skb, &proxy_tup, tuple_len, BPF_F_CURRENT_NETNS, 0);
         if (sk && sk->state != BPF_TCP_LISTEN) {

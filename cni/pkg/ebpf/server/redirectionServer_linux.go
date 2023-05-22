@@ -166,7 +166,7 @@ func (r *RedirectServer) UpdateHostIP(ips []string) error {
 	return nil
 }
 
-func AddPodToMesh(ifIndex uint32, macAddr net.HardwareAddr, ips []netip.Addr) error {
+func AddPodToMesh(ifIndex uint32, macAddr net.HardwareAddr, ipAddrs []netip.Addr) error {
 	r := RedirectServer{}
 
 	if err := setLimit(); err != nil {
@@ -196,20 +196,27 @@ func AddPodToMesh(ifIndex uint32, macAddr net.HardwareAddr, ips []netip.Addr) er
 	}
 	copy(mapInfo.MacAddr[:], macAddr)
 
-	if len(ips) == 0 {
-		return fmt.Errorf("nil ips inputed")
+	ips, err := r.parseIPs(ipAddrs)
+	if err != nil {
+		return err
 	}
-	// TODO: support multiple IPs and IPv6
-	ipAddr := ips[0]
-	// ip slice is just in network endian
-	ip := ipAddr.AsSlice()
-	if len(ip) != 4 {
-		return fmt.Errorf("invalid ip addr(%s), ipv4 is supported", ipAddr.String())
-	}
-	if err := r.obj.AppInfo.Update(ip, mapInfo, ebpf.UpdateAny); err != nil {
-		multiErr = multierror.Append(multiErr, err)
-		if err := r.detachTCForWorkload(ifIndex); err != nil {
-			multiErr = multierror.Append(multiErr, err)
+	for _, ip := range ips {
+		if len(ip) == 4 {
+			if err := r.obj.AppInfo.Update(ip, mapInfo, ebpf.UpdateAny); err != nil {
+				multiErr = multierror.Append(multiErr, err)
+				if err := r.detachTCForWorkload(ifIndex); err != nil {
+					multiErr = multierror.Append(multiErr, err)
+					break
+				}
+			}
+		} else if len(ip) == 16 {
+			if err := r.obj.AppInfoIpv6.Update(ip, mapInfo, ebpf.UpdateAny); err != nil {
+				multiErr = multierror.Append(multiErr, err)
+				if err := r.detachTCForWorkload(ifIndex); err != nil {
+					multiErr = multierror.Append(multiErr, err)
+					break
+				}
+			}
 		}
 	}
 
@@ -367,14 +374,16 @@ func (r *RedirectServer) parseIPs(ipAddrs []netip.Addr) ([][]byte, error) {
 	if len(ipAddrs) == 0 {
 		return nil, fmt.Errorf("nil ipAddrs inputed")
 	}
-	// TODO: support multiple IPs and IPv6
-	ipAddr := ipAddrs[0]
-	// ip slice is just in network endian
-	ip := ipAddr.AsSlice()
-	if len(ip) != 4 {
-		return nil, fmt.Errorf("invalid ip addr(%s), ipv4 is supported", ipAddr.String())
+	ips := [][]byte{}
+	for _, ipAddr := range ipAddrs {
+		// ip slice is just in network endian
+		ip := ipAddr.AsSlice()
+		if len(ip) != 4 && len(ip) != 16 {
+			return nil, fmt.Errorf("invalid ip addr(%s)", ipAddr.String())
+		}
+		ips = append(ips, ip)
 	}
-	return [][]byte{ip}, nil
+	return ips, nil
 }
 
 func (r *RedirectServer) RemovePod(ipAddrs []netip.Addr, ifIndex uint32) error {
@@ -384,7 +393,7 @@ func (r *RedirectServer) RemovePod(ipAddrs []netip.Addr, ifIndex uint32) error {
 	if err != nil {
 		return err
 	}
-	ip := ips[0]
+
 	if ifIndex != 0 {
 		if err := r.detachTCForWorkload(ifIndex); err != nil {
 			multiErr = multierror.Append(multiErr, err)
@@ -392,8 +401,16 @@ func (r *RedirectServer) RemovePod(ipAddrs []netip.Addr, ifIndex uint32) error {
 	} else {
 		log.Debugf("zero ifindex for app removal")
 	}
-	if err := r.obj.AppInfo.Delete(ip); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-		multiErr = multierror.Append(multiErr, err)
+	for _, ip := range ips {
+		if len(ip) == 4 {
+			if err := r.obj.AppInfo.Delete(ip); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				multiErr = multierror.Append(multiErr, err)
+			}
+		} else if len(ip) == 16 {
+			if err := r.obj.AppInfoIpv6.Delete(ip); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				multiErr = multierror.Append(multiErr, err)
+			}
+		}
 	}
 	return multiErr.ErrorOrNil()
 }
@@ -462,7 +479,6 @@ func (r *RedirectServer) handleRequest(args *RedirectArgs) error {
 			if err != nil {
 				return err
 			}
-			ip := ips[0]
 			if err := r.attachTCForWorkLoad(ifindex); err != nil {
 				multiErr = multierror.Append(multiErr, err)
 				if err := r.detachTCForWorkload(ifindex); err != nil {
@@ -470,10 +486,23 @@ func (r *RedirectServer) handleRequest(args *RedirectArgs) error {
 				}
 				return multiErr.ErrorOrNil()
 			}
-			if err := r.obj.AppInfo.Update(ip, mapInfo, ebpf.UpdateAny); err != nil {
-				multiErr = multierror.Append(multiErr, err)
-				if err := r.detachTCForWorkload(ifindex); err != nil {
-					multiErr = multierror.Append(multiErr, err)
+			for _, ip := range ips {
+				if len(ip) == 4 {
+					if err := r.obj.AppInfo.Update(ip, mapInfo, ebpf.UpdateAny); err != nil {
+						multiErr = multierror.Append(multiErr, err)
+						if err := r.detachTCForWorkload(ifindex); err != nil {
+							multiErr = multierror.Append(multiErr, err)
+							break
+						}
+					}
+				} else if len(ip) == 16 {
+					if err := r.obj.AppInfoIpv6.Update(ip, mapInfo, ebpf.UpdateAny); err != nil {
+						multiErr = multierror.Append(multiErr, err)
+						if err := r.detachTCForWorkload(ifindex); err != nil {
+							multiErr = multierror.Append(multiErr, err)
+							break
+						}
+					}
 				}
 			}
 		}

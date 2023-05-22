@@ -46,9 +46,11 @@ type Server struct {
 	mu         sync.Mutex
 	ztunnelPod *corev1.Pod
 
-	iptablesCommand lazy.Lazy[string]
-	redirectMode    RedirectMode
-	ebpfServer      *ebpf.RedirectServer
+	iptablesCommand  lazy.Lazy[string]
+	ip6tablesCommand lazy.Lazy[string]
+
+	redirectMode RedirectMode
+	ebpfServer   *ebpf.RedirectServer
 }
 
 type AmbientConfigFile struct {
@@ -68,7 +70,11 @@ func NewServer(ctx context.Context, args AmbientArgs) (*Server, error) {
 	}
 
 	s.iptablesCommand = lazy.New(func() (string, error) {
-		return s.detectIptablesCommand(), nil
+		return "iptables-" + s.detectIptablesCommand(), nil
+	})
+
+	s.ip6tablesCommand = lazy.New(func() (string, error) {
+		return "ip6tables-" + s.detectIptablesCommand(), nil
 	})
 
 	switch args.RedirectMode {

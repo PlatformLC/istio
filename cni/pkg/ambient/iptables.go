@@ -53,7 +53,7 @@ func (s *Server) detectIptablesCommand() string {
 
 	if numLegacyLines > 10 {
 		log.Infof("Detected iptables-legacy")
-		return "iptables-legacy"
+		return "legacy"
 	}
 
 	output, err = executeOutput("bash", "-c",
@@ -70,14 +70,19 @@ func (s *Server) detectIptablesCommand() string {
 
 	if numLegacyLines > numNftLines {
 		log.Infof("Using iptables command: iptables-legacy")
-		return "iptables-legacy"
+		return "legacy"
 	}
 	log.Infof("Using iptables command: iptables-nft")
-	return "iptables-nft"
+	return "nft"
 }
 
 func (s *Server) IptablesCmd() string {
 	c, _ := s.iptablesCommand.Get()
+	return c
+}
+
+func (s *Server) Ip6tablesCmd() string {
+	c, _ := s.ip6tablesCommand.Get()
 	return c
 }
 
@@ -297,6 +302,17 @@ func (s *Server) iptablesAppend(rules []*iptablesRule) error {
 	for _, rule := range rules {
 		log.Debugf("Appending rule: %+v", rule)
 		err := execute(s.IptablesCmd(), append([]string{"-t", rule.Table, "-A", rule.Chain}, rule.RuleSpec...)...)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) ip6tablesAppend(rules []*iptablesRule) error {
+	for _, rule := range rules {
+		log.Debugf("Appending rule: %+v", rule)
+		err := execute(s.Ip6tablesCmd(), append([]string{"-t", rule.Table, "-A", rule.Chain}, rule.RuleSpec...)...)
 		if err != nil {
 			return err
 		}

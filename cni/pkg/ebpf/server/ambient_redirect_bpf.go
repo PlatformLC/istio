@@ -33,6 +33,8 @@ type ambient_redirectAppInfo struct {
 
 type ambient_redirectHostInfo struct{ Addr [4]uint32 }
 
+type ambient_redirectIn6Addr struct{ In6U struct{ U6Addr8 [16]uint8 } }
+
 type ambient_redirectZtunnelInfo struct {
 	Ifindex uint32
 	MacAddr [6]uint8
@@ -93,6 +95,7 @@ type ambient_redirectProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type ambient_redirectMapSpecs struct {
 	AppInfo     *ebpf.MapSpec `ebpf:"app_info"`
+	AppInfoIpv6 *ebpf.MapSpec `ebpf:"app_info_ipv6"`
 	HostIpInfo  *ebpf.MapSpec `ebpf:"host_ip_info"`
 	LogLevel    *ebpf.MapSpec `ebpf:"log_level"`
 	ZtunnelInfo *ebpf.MapSpec `ebpf:"ztunnel_info"`
@@ -118,6 +121,7 @@ func (o *ambient_redirectObjects) Close() error {
 // It can be passed to loadAmbient_redirectObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ambient_redirectMaps struct {
 	AppInfo     *ebpf.Map `ebpf:"app_info"`
+	AppInfoIpv6 *ebpf.Map `ebpf:"app_info_ipv6"`
 	HostIpInfo  *ebpf.Map `ebpf:"host_ip_info"`
 	LogLevel    *ebpf.Map `ebpf:"log_level"`
 	ZtunnelInfo *ebpf.Map `ebpf:"ztunnel_info"`
@@ -126,6 +130,7 @@ type ambient_redirectMaps struct {
 func (m *ambient_redirectMaps) Close() error {
 	return _Ambient_redirectClose(
 		m.AppInfo,
+		m.AppInfoIpv6,
 		m.HostIpInfo,
 		m.LogLevel,
 		m.ZtunnelInfo,
